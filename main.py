@@ -22,6 +22,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
+import copy
+import matplotlib.pyplot as plt
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
 
 # -------------------------
 # Config
@@ -33,16 +37,16 @@ class Config:
     batch_size: int = 256
     epochs: int = 10
     adam_lr: float = 1e-3
-    sgd_lr : float = 0.1
+    sgd_lr : float = 0.01
     weight_decay: float = 0.0  # baseline: no L2
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 8
 
     # Model
     input_dim: int = 32 * 32 * 3
     num_classes: int = 10
-    hidden_dims: Tuple[int, ...] = (1024, 512, 256)  # baseline MLP widths
-    dropout_p: float = 0.0  # baseline: no dropout
+    hidden_dims: Tuple[int, ...] = (1024, 512) # baseline MLP widths
+    dropout_p: float = 0.5  # baseline: no dropout
     
     # Initialization choices
     init_name: str = "kaiming"  # {"kaiming", "xavier"}
@@ -66,8 +70,8 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # Determinism (can slow down a bit)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 @torch.no_grad()
@@ -79,6 +83,47 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+@torch.no_grad()
+def get_theta_vec(model: nn.Module) -> torch.Tensor:
+    return parameters_to_vector(model.parameters()).detach().clone()
+
+@torch.no_grad()
+def set_theta_vec(model: nn.Module, theta: torch.Tensor) -> None:
+    vector_to_parameters(theta, model.parameters())
+
+@torch.no_grad()
+def eval_ce_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total_loss = 0.0
+    total_n = 0
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        loss = criterion(logits, y)
+        total_loss += loss.item()
+        total_n += x.size(0)
+    return total_loss / total_n
+
+def loss_curve_1d(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    theta_base: torch.Tensor,
+    delta: torch.Tensor,
+    alphas: torch.Tensor,
+) -> list[float]:
+    losses = []
+    theta_backup = get_theta_vec(model)  # restore later
+
+    for a in alphas:
+        theta_pert = theta_base + a * delta
+        set_theta_vec(model, theta_pert)
+        losses.append(eval_ce_loss(model, loader, device))
+
+    set_theta_vec(model, theta_backup)
+    return losses
 
 # -------------------------
 # Data
@@ -289,17 +334,19 @@ def main() -> None:
 
     criterion = nn.CrossEntropyLoss()
     optimizer = make_optimizer(cfg, model)
+    theta0 = get_theta_vec(model).to(device)
 
-    best_val_acc = -1.0
+
+    best_val_loss = float("inf")
     best_state = None
 
     for epoch in range(1, cfg.epochs + 1):
         train_metrics = run_one_epoch(model, train_loader, criterion, optimizer, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
 
-        if val_metrics["acc"] > best_val_acc:
-            best_val_acc = val_metrics["acc"]
-            # Keep best model by validation accuracy
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            # Keep best model by validation loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         print(
@@ -311,10 +358,49 @@ def main() -> None:
     # Load best model (by val acc), then evaluate on test split
     if best_state is not None:
         model.load_state_dict(best_state)
+        
+    theta_star = get_theta_vec(model).to(device)
+
 
     test_metrics = evaluate(model, test_loader, criterion, device)
-    print(f"Best val acc: {best_val_acc:.4f}")
+    print(f"Best val loss: {best_val_loss:.4f}")
     print(f"Test loss: {test_metrics['loss']:.4f} | Test acc: {test_metrics['acc']:.4f}")
+    
+    # Pick a fixed evaluation set for the landscape
+    landscape_loader = val_loader  
+
+    # Random direction δ (same size as θ), normalized
+    delta = torch.randn_like(theta_star)
+    delta = delta / (delta.norm() + 1e-12)
+
+    # Optional: scale δ so that alpha is "fraction of ||theta||"
+    # This makes alpha ranges more interpretable across models.
+    delta = delta * (theta_star.norm() + 1e-12)
+
+    # Sweep α values
+    alphas = torch.linspace(-0.5, 0.5, steps=41, device=device)  # adjust range if needed
+
+    # Compute loss curves
+    losses_init = loss_curve_1d(model, landscape_loader, device, theta0, delta, alphas)
+    losses_trained = loss_curve_1d(model, landscape_loader, device, theta_star, delta, alphas)
+
+    # Plot
+    alphas_cpu = alphas.detach().cpu().numpy()
+    plt.figure()
+    plt.plot(alphas_cpu, losses_init)
+    plt.xlabel("alpha")
+    plt.ylabel("cross-entropy loss")
+    plt.title("1D loss landscape at initialization (theta0)")
+    plt.grid(True)
+    plt.show()
+
+    plt.figure()
+    plt.plot(alphas_cpu, losses_trained)
+    plt.xlabel("alpha")
+    plt.ylabel("cross-entropy loss")
+    plt.title("1D loss landscape after training (theta*)")
+    plt.grid(True)
+    plt.show()
 
 
 if __name__ == "__main__":
